@@ -1,0 +1,19 @@
+{
+  "name": "museum-fragment-registration-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "description": "博物馆数字碎片刚性配准工作台：加权 Kabsch + RANSAC 多候选 + ICP 局部优化，含退化/对称/镜像不确定性审计",
+  "main": "server/server.js",
+  "scripts": {
+    "postinstall": "node scripts/fetch-vendor.js",
+    "fetch-vendor": "node scripts/fetch-vendor.js",
+    "start": "node server/server.js",
+    "test:math": "node tests/validate.js",
+    "test:api": "node tests/api.test.js",
+    "test": "node tests/validate.js && node tests/api.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

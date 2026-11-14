@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>博物馆数字碎片配准工作台</title>
+<link rel="stylesheet" href="/css/app.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three.module.js",
+    "three/addons/controls/OrbitControls.js": "/vendor/OrbitControls.js"
+  }
+}
+</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <strong>数字碎片配准工作台</strong>
+    <span class="sub">刚性配准 · 多候选 · 不确定性审计（不作现实修复结论）</span>
+  </div>
+  <div class="conventions" id="conventions">单位/坐标系：未加载</div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <section class="card">
+      <h2>1. 载入程序生成数据</h2>
+      <label>场景
+        <select id="scenario">
+          <option value="bowl">碗形碎片（完整对应）</option>
+          <option value="plate">平板碎片（双层标志点）</option>
+          <option value="partial">局部缺失碎片</option>
+          <option value="mirrored">镜像碎片（左右手翻转）</option>
+          <option value="wrongpairs">含错误对应点</option>
+          <option value="bigtwist">大角度旋转（140°）</option>
+        </select>
+      </label>
+      <label>随机种子 <input type="number" id="seed" value="42" min="1" /></label>
+      <button id="loadBtn" class="primary">生成并载入</button>
+      <div id="datasetInfo" class="muted small"></div>
+    </section>
+
+    <section class="card">
+      <h2>2. 对应点与误差权重</h2>
+      <p class="muted small">在两侧视口点击表面取点；目标/源权重分开设置，融合为方差倒数权重。</p>
+      <div class="row">
+        <button id="addPairBtn">添加对应点对</button>
+        <button id="clearPairsBtn" class="ghost">清空</button>
+      </div>
+      <div id="pairList" class="pair-list"></div>
+    </section>
+
+    <section class="card">
+      <h2>3. 刚性配准（无缩放）</h2>
+      <label>内点阈值 (mm) <input type="number" id="inlierThreshold" placeholder="自动=对角2%" step="0.1" /></label>
+      <label>重叠搜索半径 (mm) <input type="number" id="overlapDistance" placeholder="自动=对角2%" step="0.1" /></label>
+      <button id="registerBtn" class="primary" disabled>估计刚性变换（Kabsch + RANSAC）</button>
+      <p class="muted small">系统保留多个候选；退化、对称、重叠不足均给出警告，不因残差小断言同源。</p>
+    </section>
+
+    <section class="card">
+      <h2>4. 局部优化与确认</h2>
+      <button id="icpBtn" disabled>对选中方案做 ICP 局部优化</button>
+      <div class="row">
+        <input id="operator" placeholder="操作员姓名" />
+      </div>
+      <div class="row">
+        <button id="acceptBtn" class="ok" disabled>人工确认采纳</button>
+        <button id="rejectBtn" class="danger" disabled>人工否决</button>
+      </div>
+      <button id="exportBtn" class="ghost" disabled>导出可复算 JSON</button>
+    </section>
+  </aside>
+
+  <section class="viewport-area">
+    <div class="view-grid">
+      <div class="view-cell">
+        <div class="view-title">目标碎片（固定，不被覆盖）</div>
+        <div id="targetView" class="view-canvas"></div>
+      </div>
+      <div class="view-cell">
+        <div class="view-title">源碎片（施加估计变换）</div>
+        <div id="sourceView" class="view-canvas"></div>
+      </div>
+    </div>
+    <div class="view-cell overlap-cell">
+      <div class="view-title">
+        叠合与残差视图
+        <span class="view-tools">
+          <label><input type="checkbox" id="showResidual" checked /> 残差着色</label>
+          <label><input type="checkbox" id="showMesh" /> 网格面</label>
+          <label>剖面
+            <select id="clipAxis">
+              <option value="none">关闭</option>
+              <option value="x">X 法向</option>
+              <option value="y">Y 法向</option>
+              <option value="z">Z 法向</option>
+            </select>
+          </label>
+          <input type="range" id="clipPos" min="-1" max="1" step="0.01" value="0" />
+        </span>
+      </div>
+      <div id="overlapView" class="view-canvas tall"></div>
+      <div class="legend">
+        <span>残差色标：</span>
+        <span class="swatch good"></span> 0
+        <span class="swatch mid"></span>
+        <span class="swatch bad"></span> 大（mm，按当前方案最大残差归一）
+      </div>
+    </div>
+  </section>
+
+  <aside class="sidebar right">
+    <section class="card">
+      <h2>候选方案</h2>
+      <div id="schemeList" class="scheme-list muted small">尚未配准</div>
+    </section>
+    <section class="card">
+      <h2>诊断与残差</h2>
+      <div id="diagnostics" class="diagnostics muted small">选择方案后显示</div>
+    </section>
+    <section class="card">
+      <h2>离群点审计</h2>
+      <div id="outlierList" class="outlier-list muted small">无</div>
+    </section>
+    <section class="card">
+      <h2>确认记录</h2>
+      <div id="confirmRecord" class="muted small">未确认</div>
+    </section>
+  </aside>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<footer class="footnote">
+  所有变换仅旋转+平移（det R=+1），原始模型永不被覆盖。残差小不等于真实同源；镜像、退化与对称情形以警告和多候选形式保留。
+</footer>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
