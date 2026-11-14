@@ -8,9 +8,11 @@
     "postinstall": "node scripts/fetch-vendor.js",
     "fetch-vendor": "node scripts/fetch-vendor.js",
     "start": "node server/server.js",
+    "diagnose": "node scripts/diagnose.js",
     "test:math": "node tests/validate.js",
+    "test:diagnostics": "node tests/diagnostics.test.js",
     "test:api": "node tests/api.test.js",
-    "test": "node tests/validate.js && node tests/api.test.js"
+    "test": "node tests/validate.js && node tests/diagnostics.test.js && node tests/api.test.js"
   },
   "engines": {
     "node": ">=18"

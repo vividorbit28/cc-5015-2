@@ -9,9 +9,10 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const {
-  weightedKabsch, applyTransform, mApply, vadd, vsub, vdist, mDet,
+  weightedKabsch, applyTransform, mApply, vsub, mDet,
 } = require('./linalg');
 const reg = require('./registration');
+const diag = require('./diagnostics');
 const { generateDataset } = require('./synthdata');
 
 const PORT = process.env.PORT || 8080;
@@ -74,15 +75,6 @@ function newSessionId() {
   return crypto.randomBytes(9).toString('hex');
 }
 
-// 对角尺寸，用于自动阈值
-function diagonal(points) {
-  const mn = [Infinity, Infinity, Infinity];
-  const mx = [-Infinity, -Infinity, -Infinity];
-  for (const p of points)
-    for (let k = 0; k < 3; k++) { mn[k] = Math.min(mn[k], p[k]); mx[k] = Math.max(mx[k], p[k]); }
-  return Math.hypot(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
-}
-
 function publicSession(s) {
   return {
     sessionId: s.id,
@@ -114,10 +106,13 @@ function publicScheme(sc) {
     cloudRms: sc.cloudRms,
     cloudMedian: sc.cloudMedian,
     overlapFraction: sc.overlapFraction,
+    targetCoverageFraction: sc.targetCoverageFraction,
     unmatchedSourceCount: sc.unmatchedSourceCount,
     diagnostics: sc.diagnostics,
     warnings: sc.warnings || [],
     icp: sc.icpSummary || null,
+    evidence: sc.evidenceSummary || null,
+    replay: sc.replaySummary || null,
     symmetry: sc.symmetry || null,
     pointResiduals: sc.pointResiduals,
     createdAt: sc.createdAt,
@@ -209,11 +204,16 @@ const server = http.createServer(async (req, res) => {
       const tPts = corr.map((c) => c.targetPoint);
       const tW = corr.map((c) => c.targetWeight);
       const sW = corr.map((c) => c.sourceWeight);
-      const diag = diagonal(tPts.concat(sPts));
-      const inlierThreshold = Number.isFinite(body.inlierThreshold)
-        ? body.inlierThreshold : diag * 0.02;
-      const overlapDistance = Number.isFinite(body.overlapDistance)
-        ? body.overlapDistance : diagonal(session.dataset.target.cloud.points) * 0.02;
+      const cfg = diag.deriveSceneConfig({
+        targetPoints: session.dataset.target.cloud.points,
+        correspondencePoints: tPts.concat(sPts),
+        overrides: {
+          inlierThreshold: body.inlierThreshold,
+          overlapDistance: body.overlapDistance,
+        },
+      });
+      const inlierThreshold = cfg.inlierThreshold;
+      const overlapDistance = cfg.overlapDistance;
 
       // 1) 全部点的加权 Kabsch（基线，含退化诊断）
       let baseline;
@@ -269,6 +269,7 @@ const server = http.createServer(async (req, res) => {
           cloudRms: ev.cloudRms,
           cloudMedian: ev.cloudMedian,
           overlapFraction: ev.overlapFraction,
+          targetCoverageFraction: ev.targetCoverageFraction,
           unmatchedSourceCount: ev.unmatchedSourceCount,
           pointResiduals: ev.pointResiduals,
           warnings: ev.warnings,
@@ -316,6 +317,7 @@ const server = http.createServer(async (req, res) => {
           cloudRms: ev.cloudRms,
           cloudMedian: ev.cloudMedian,
           overlapFraction: ev.overlapFraction,
+          targetCoverageFraction: ev.targetCoverageFraction,
           unmatchedSourceCount: ev.unmatchedSourceCount,
           pointResiduals: ev.pointResiduals,
           warnings: Array.from(new Set([...(sc.warnings || []), ...ev.warnings])),
@@ -337,25 +339,80 @@ const server = http.createServer(async (req, res) => {
       const scheme = session.schemes[sid];
       if (!scheme) return json(res, 404, { error: '方案不存在' });
       const body = await readBody(req);
-      const overlapDistance = session.lastParams
-        ? session.lastParams.overlapDistance
-        : diagonal(session.dataset.target.cloud.points) * 0.02;
+      let cfg;
+      try {
+        cfg = diag.deriveSceneConfig({
+          targetPoints: session.dataset.target.cloud.points,
+          correspondencePoints: session.correspondences
+            .flatMap((c) => [c.targetPoint, c.sourcePoint]),
+          overrides: {
+            inlierThreshold: body.inlierThreshold ?? (session.lastParams && session.lastParams.inlierThreshold),
+            overlapDistance: body.overlapDistance ?? (session.lastParams && session.lastParams.overlapDistance),
+            maxDistance: body.maxDistance,
+            maxIterations: body.maxIterations,
+            huber: body.huber,
+            huberK: body.huberK,
+          },
+        });
+      } catch (e) {
+        return json(res, 400, { error: `配准参数无效：${e.message}` });
+      }
+      const { overlapDistance, inlierThreshold, maxDistance, huberK, maxIterations } = cfg;
       const result = reg.icpRefine(
         session.dataset.source.cloud,
         session.dataset.target.cloud,
         scheme.transform,
-        {
-          maxIterations: body.maxIterations || 40,
-          tolerance: 1e-8,
-          maxDistance: Number.isFinite(body.maxDistance) ? body.maxDistance : overlapDistance * 2,
-          huberK: body.huber === false ? null : overlapDistance,
-        },
+        { maxIterations, tolerance: cfg.tolerance, maxDistance, huberK },
       );
       // ICP 结果另存为新方案，不覆盖原方案与原始模型
       const moved = applyTransform(session.dataset.source.cloud.points, result.transform);
       const stats = reg.cloudOverlapStats(moved,
         session.dataset.target.cloud.points,
         overlapDistance * 2);
+
+      // 迭代证据：输入/对应/权重/每轮位姿更新与停止条件，可与命令行复跑对账
+      let evidence = null;
+      let evidenceError = null;
+      try {
+        evidence = diag.buildIcpEvidence({
+          sourceCloud: session.dataset.source.cloud,
+          targetCloud: session.dataset.target.cloud,
+          correspondence: session.correspondences,
+          initialPose: scheme.transform,
+          icpResult: result,
+          inlierThreshold,
+          overlapDistance,
+          maxIterations,
+          huberK,
+          method: 'icp',
+        });
+      } catch (e) {
+        evidenceError = e.message;
+      }
+      const replayRecords = evidence ? evidence.rounds.map((r) => {
+        const snap = {
+          iteration: r.iteration,
+          inputPose: r.inputPose,
+          maxDistance,
+          huberK,
+          fingerprint: r.inputFingerprint,
+        };
+        const check = diag.replayRound(
+          session.dataset.source.cloud.points,
+          session.dataset.target.cloud.points,
+          snap,
+        );
+        return {
+          iteration: r.iteration,
+          fingerprint: snap.fingerprint,
+          replayFingerprint: check.replayFingerprint,
+          match: check.match,
+          matchedCount: check.matchedCount,
+          residual: check.residual,
+        };
+      }) : [];
+      const replayStable = replayRecords.every((r) => r.match);
+
       const refined = {
         id: session.schemes.length,
         label: `${scheme.label} → ICP 局部优化`,
@@ -368,19 +425,51 @@ const server = http.createServer(async (req, res) => {
         diagnostics: scheme.diagnostics,
         icpSummary: {
           converged: result.converged,
+          stopCode: result.stopCode,
           iterations: result.iterations,
           reason: result.reason || '收敛',
           history: result.history,
           rejectedPairs: result.rejected.slice(0, 20),
           rejectedCount: result.rejected.length,
           pairCount: result.pairs.length || result.history.at(-1)?.pairCount || 0,
+          noiseFloor: result.noiseFloor,
+          cause: evidence ? evidence.cause : null,
+          stageFindings: evidence ? evidence.stageFindings : null,
+          residualTrend: evidence ? evidence.residualTrend : null,
+          validCorrespondenceTrend: evidence ? evidence.validCorrespondenceTrend : null,
         },
-        warnings: result.converged ? [] : [`ICP 未完全收敛：${result.reason}`],
+        evidenceSummary: evidence ? {
+          version: evidence.version,
+          fingerprint: evidence.fingerprint,
+          stop: evidence.stop,
+          cause: evidence.cause,
+          coverage: evidence.coverage,
+          correspondenceInitial: evidence.correspondenceInitial,
+          correspondenceFinal: evidence.correspondenceFinal,
+          noiseFloor: evidence.noiseFloor,
+          scaleRatios: evidence.scaleRatios,
+          roundBudget: evidence.roundBudget,
+          stageFindings: evidence.stageFindings,
+        } : { error: evidenceError },
+        replaySummary: {
+          stable: replayStable,
+          rounds: replayRecords,
+          note: replayStable
+            ? '每轮输入位姿的独立重放指纹与本轮记录一致'
+            : '存在重放指纹不一致的轮次，证据不可信',
+        },
+        evidenceFull: evidence,
+        warnings: result.converged ? [] : [`ICP 未收敛：${result.reason}`],
         createdAt: new Date().toISOString(),
         ...stats,
       };
       if (mDet(refined.transform.rotation) <= 0)
         refined.warnings.push('ICP 结果含反射分量，已标记为非法刚性变换');
+      if (evidence && evidence.cause && evidence.cause.primary !== diag.CAUSE.NONE) {
+        refined.warnings.push(`诊断主因：${evidence.cause.primary}`);
+      }
+      if (evidenceError) refined.warnings.push(`诊断证据生成失败：${evidenceError}`);
+      if (!replayStable) refined.warnings.push('迭代证据的逐轮重放不一致');
       session.schemes.push(refined);
       return json(res, 200, publicSession(session));
     }
@@ -408,22 +497,176 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, publicSession(session));
     }
 
+    // 诊断预览：给定任意初始位姿（界面拖动滑块或命令行），返回
+    // 有效对应、对应原因、距离残差、覆盖与阶段定位。不修改会话状态、不生成方案，
+    // 确保“拖动试配准”与“正式配准”共用同一内核，且预览失败能如实反馈。
+    if (route.startsWith('POST /api/sessions/') && sub === '/diagnose') {
+      const body = await readBody(req);
+      const pose = body.pose;
+      if (!pose || !Array.isArray(pose.rotation) || pose.rotation.length !== 9 ||
+          !Array.isArray(pose.translation) || pose.translation.length !== 3 ||
+          !pose.rotation.every(Number.isFinite) || !pose.translation.every(Number.isFinite)) {
+        return json(res, 400, { error: 'pose 必须是 3x3 旋转与三维平移（有限数值）' });
+      }
+      if (session.correspondences.length === 0)
+        return json(res, 400, { error: '没有对应点，无法给出对应原因' });
+      // 预览与正式配准共用同一推导函数；返回参数来源，避免隐式默认值遮错
+      let cfg;
+      try {
+        cfg = diag.deriveSceneConfig({
+          targetPoints: session.dataset.target.cloud.points,
+          correspondencePoints: session.correspondences
+            .flatMap((c) => [c.targetPoint, c.sourcePoint]),
+          overrides: {
+            inlierThreshold: body.inlierThreshold,
+            overlapDistance: body.overlapDistance,
+            maxDistance: body.maxDistance,
+            huber: body.huber,
+            huberK: body.huberK,
+          },
+        });
+      } catch (e) {
+        return json(res, 400, { error: `诊断参数无效：${e.message}` });
+      }
+      const { inlierThreshold, overlapDistance, maxDistance, huberK } = cfg;
+      const scaleRatios = diag.correspondenceDistanceRatios(
+        session.correspondences.map((c) => c.sourcePoint),
+        session.correspondences.map((c) => c.targetPoint),
+      );
+      const moved = applyTransform(session.dataset.source.cloud.points, pose);
+      const coverage = diag.coverageStats(moved,
+        session.dataset.target.cloud.points, overlapDistance);
+      const pairReport = diag.nearestCorrespondenceStats(moved,
+        session.dataset.target.cloud.points, maxDistance, huberK);
+      const corrReport = diag.correspondenceReport(
+        session.correspondences.map((c) => c.sourcePoint),
+        session.correspondences.map((c) => c.targetPoint),
+        session.correspondences.map((c) => {
+          const denom = c.targetWeight + c.sourceWeight;
+          return denom > 1e-15 ? (c.targetWeight * c.sourceWeight) / denom : 0;
+        }),
+        pose, inlierThreshold,
+      );
+      const degeneracy = body.degeneracy || null;
+      // 拖动预览也必须给出与位姿无关的配对一致性，否则会把“初值错”误报成 NONE/低重叠。
+      const corrWeights = session.correspondences.map((c) => {
+        const denom = c.targetWeight + c.sourceWeight;
+        return denom > 1e-15 ? (c.targetWeight * c.sourceWeight) / denom : 0;
+      });
+      const rigidConsistency = diag.rigidConsistencyCheck(
+        session.correspondences.map((c) => c.sourcePoint),
+        session.correspondences.map((c) => c.targetPoint),
+        corrWeights,
+        inlierThreshold,
+      );
+      let reachableOverlap = null;
+      if (rigidConsistency.bestTransform) {
+        const reachMoved = applyTransform(session.dataset.source.cloud.points,
+          rigidConsistency.bestTransform);
+        reachableOverlap = diag.coverageStats(reachMoved,
+          session.dataset.target.cloud.points, overlapDistance).overlapFraction;
+      }
+      const cause = diag.classifyCause({
+        correspondence: corrReport,
+        rounds: [],
+        stopCode: pairReport.satisfiesMinimum ? null : diag.STOP.INSUFFICIENT,
+        noiseFloor: diag.samplingNoiseFloor(session.dataset.source.cloud.points),
+        initialOverlap: coverage.overlapFraction,
+        finalOverlap: coverage.overlapFraction,
+        targetCoverage: coverage.targetCoverageFraction,
+        scaleRatios,
+        degeneracy,
+        symmetryAlternatives: [],
+        rigidConsistency,
+        inputPoseInliers: corrReport.inlierCount,
+        reachableOverlap,
+      });
+      // 预览对应原因按源点云逐点裁剪，限制日志成本
+      const sampleStride = Math.max(1, Math.ceil(pairReport.pairs.length / 400));
+      const pairSamples = pairReport.pairs
+        .filter((_, i) => i % sampleStride === 0)
+        .slice(0, 400);
+      return json(res, 200, {
+        params: { inlierThreshold, overlapDistance, maxDistance, huberK },
+        paramsDerivedFrom: cfg.derivedFrom,
+        coverage: {
+          overlapFraction: coverage.overlapFraction,
+          targetCoverageFraction: coverage.targetCoverageFraction,
+          unmatchedSourceCount: coverage.unmatchedSourceCount,
+          cloudRms: coverage.cloudRms,
+          cloudMedian: coverage.cloudMedian,
+          cloudMax: coverage.cloudMax,
+          // 与源点云同索引：null 表示搜索半径内无目标点（碎片未重叠）
+          pointResiduals: coverage.pointResiduals,
+        },
+        validCorrespondence: {
+          matchedCount: pairReport.matchedCount,
+          unmatchedCount: pairReport.unmatchedCount,
+          minRequired: pairReport.minRequired,
+          satisfiesMinimum: pairReport.satisfiesMinimum,
+          residual: pairReport.residual,
+          weightSum: pairReport.weightSum,
+        },
+        pairSamples,
+        correspondencePoints: {
+          threshold: corrReport.threshold,
+          inlierCount: corrReport.inlierCount,
+          outlierCount: corrReport.outlierCount,
+          inlierRatio: corrReport.inlierRatio,
+          residual: corrReport.residual,
+          bimodal: corrReport.bimodal,
+          items: corrReport.items,
+        },
+        scaleRatios,
+        cause,
+      });
+    }
+
+    // 证据导出/重放核对：返回完整迭代证据、逐轮重放结果与一致性结论
+    if (route.startsWith('GET /api/sessions/') && sub.startsWith('/schemes/') && sub.endsWith('/evidence')) {
+      const sid = Number(sub.split('/')[2]);
+      const scheme = session.schemes[sid];
+      if (!scheme) return json(res, 404, { error: '方案不存在' });
+      if (!scheme.evidenceFull)
+        return json(res, 409, { error: '该方案没有迭代证据（仅 ICP 方案产生逐轮证据）' });
+      const evidence = scheme.evidenceFull;
+      const replay = evidence.rounds.map((r) => diag.replayRound(
+        session.dataset.source.cloud.points,
+        session.dataset.target.cloud.points,
+        {
+          inputPose: r.inputPose,
+          maxDistance: evidence.config.overlapDistance * 2,
+          huberK: evidence.config.huberK,
+          fingerprint: r.inputFingerprint,
+        },
+      ).match);
+      return json(res, 200, {
+        schemeId: sid,
+        evidence,
+        replay,
+        replayStable: replay.every(Boolean),
+      });
+    }
+
     if (route.startsWith('GET /api/sessions/') && sub.startsWith('/schemes/') && sub.endsWith('/export')) {
       const sid = Number(sub.split('/')[2]);
       const scheme = session.schemes[sid];
       if (!scheme) return json(res, 404, { error: '方案不存在' });
       const d = session.dataset;
       const payload = {
-        exportVersion: 1,
+        exportVersion: 2,
         exportedAt: new Date().toISOString(),
         conventions: {
           unit: d.meta.unit, handedness: d.meta.handedness, upAxis: d.meta.upAxis,
           transformDirection: 'transformed_source = R * source + t（无缩放）',
+          evidenceScope: '迭代证据只含点云/对应点/权重/位姿与停止条件，不含测试真值',
         },
         scenario: d.meta.scenario,
         groundTruth: d.meta.groundTruth,
         correspondences: session.correspondences,
         scheme: publicScheme(scheme),
+        evidence: scheme.evidenceFull || null,
+        replay: scheme.replaySummary || null,
         confirmation: session.confirmation,
         transformedSourceCloud: {
           points: applyTransform(d.source.cloud.points, scheme.transform),

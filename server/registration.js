@@ -12,6 +12,13 @@ const {
   mApply, mMul, mTranspose, weightedKabsch, applyTransform,
 } = require('./linalg');
 const { KDTree } = require('./kdtree');
+const diag = require('./diagnostics');
+
+function diagError(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
 
 function median(values) {
   const s = values.slice().sort((a, b) => a - b);
@@ -64,8 +71,8 @@ function ransacCandidates(sourcePts, targetPts, options = {}) {
   const n = sourcePts.length;
   const rng = options.rng || Math.random;
   const iterations = options.iterations || 300;
-  // 阈值缺省取目标点云对角尺寸的 1%，可由调用方覆盖
   const threshold = options.inlierThreshold;
+  diag.requireFiniteNumber('inlierThreshold', threshold);
   const weights = options.weights || new Array(n).fill(1);
   const seen = new Map();
   const candidates = [];
@@ -177,19 +184,28 @@ function symmetryAlternatives(baseCand, sourceCloud, targetCloud, options = {}) 
   return alternatives;
 }
 
-// 点云层面的重叠/残差统计（变换后的源 vs 目标 KD 树）
+// 点云层面的重叠/残差统计（变换后的源 vs 目标 KD 树）。
+// 搜索半径必须由调用方给出：缺失时直接报错，而不是悄悄使用默认值。
 function cloudOverlapStats(transformedSource, targetPoints, maxDistance) {
-  const tree = new KDTree(targetPoints);
+  diag.requireFiniteNumber('maxDistance', maxDistance);
+  const targetTree = new KDTree(targetPoints);
   const distances = transformedSource.map((p) => {
-    const nn = tree.nearest(p, maxDistance);
+    const nn = targetTree.nearest(p, maxDistance);
     return nn ? nn.distance : null;
   });
   const matched = distances.filter((d) => d !== null);
   const rms = matched.length
     ? Math.sqrt(matched.reduce((a, d) => a + d * d, 0) / matched.length)
     : null;
+  // 反向覆盖：目标碎片中能被变换后源点云覆盖的比例，用于区分低重叠与错误位姿
+  const sourceTree = new KDTree(transformedSource);
+  let covered = 0;
+  for (const p of targetPoints) {
+    if (sourceTree.nearest(p, maxDistance)) covered++;
+  }
   return {
     overlapFraction: matched.length / transformedSource.length,
+    targetCoverageFraction: covered / targetPoints.length,
     unmatchedSourceCount: distances.length - matched.length,
     cloudRms: rms,
     cloudMedian: matched.length ? median(matched) : null,
@@ -200,10 +216,15 @@ function cloudOverlapStats(transformedSource, targetPoints, maxDistance) {
 
 // ICP：目标带法向量时为点到面，否则点到点；仅允许刚性更新。
 // 外层重匹配最近邻，内层对固定对应做高斯-牛顿迭代，配合 Huber 降权。
+// 每轮记录：输入位姿、有效对应数、残差摘要、位姿更新是否被接受，
+// 以及可独立重放的单轮快照（输入位姿 + 搜索参数 + 指纹）。
 function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
   const maxIter = options.maxIterations || 40;
   const tolerance = options.tolerance || 1e-9;
   const maxDist = options.maxDistance;
+  if (!Number.isFinite(maxDist) || maxDist <= 0) {
+    throw diagError('DIAG_INPUT_MISSING', 'icpRefine 需要正的最大搜索距离 maxDistance');
+  }
   const robustK = options.huberK == null ? null : options.huberK;
   const tree = new KDTree(targetCloud.points);
   let tf = {
@@ -211,8 +232,24 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
     translation: initialTf.translation.slice(),
   };
   const history = [];
+  const rounds = [];
   let rejected = [];
   let lastPairs = [];
+  let stopCode = null;
+  let stopReason = '';
+
+  // 记录诊断快照指纹（不含真值、不含时间戳）。与离线重放共用同一字段集合。
+  const roundFingerprint = (inputPose, pairs, residual) => diag.roundRecordFingerprint({
+    inputPose,
+    maxDistance: maxDist,
+    huberK: robustK,
+    matchedCount: pairs.length,
+    unmatchedCount: rejected.length,
+    residual,
+    pairs,
+  });
+
+  const pairStats = (pairs) => diag.summarize(pairs.map((p) => p.distance));
 
   const normalAt = (idx) => {
     const n = targetCloud.normals ? targetCloud.normals[idx] : null;
@@ -229,6 +266,13 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
     return cnt ? sum / cnt : Infinity;
   };
 
+  // 采样噪声地板：点云自身最近邻间距，低于此值不再有可分辨改进
+  const noiseFloor = options.noiseFloor != null
+    ? { median: options.noiseFloor, available: true }
+    : diag.samplingNoiseFloor(sourceCloud.points);
+  const plateauFactor = options.plateauFactor ?? diag.PLATEAU_NOISE_FACTOR;
+  const plateauLimit = noiseFloor.median > 0 ? noiseFloor.median * plateauFactor : 0;
+
   for (let iter = 0; iter < maxIter; iter++) {
     const moved = applyTransform(sourceCloud.points, tf);
     const pairs = [];
@@ -236,7 +280,7 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
     for (let i = 0; i < moved.length; i++) {
       const nn = tree.nearest(moved[i], maxDist);
       if (!nn) {
-        rejected.push({ sourceIndex: i, reason: `半径 ${maxDist.toExponential(2)} 内无目标最近邻（碎片缺失或未重叠）` });
+        rejected.push({ sourceIndex: i, reasonCode: 'NO_NEIGHBOR_IN_RADIUS', reason: `半径 ${maxDist.toExponential(2)} 内无目标最近邻（碎片缺失或未重叠）` });
         continue;
       }
       let weight = 1;
@@ -244,13 +288,23 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
       pairs.push({ sourceIndex: i, targetIndex: nn.index, distance: nn.distance, weight });
     }
     lastPairs = pairs;
+    const inputPose = { rotation: tf.rotation.slice(), translation: tf.translation.slice() };
+    const inputResidual = pairStats(pairs);
 
-    if (pairs.length < 6) {
-      return {
-        transform: tf, converged: false,
-        reason: `有效 ICP 对应仅 ${pairs.length} 对，少于 6，停止优化`,
-        iterations: iter, history, rejected, pairs,
-      };
+    if (pairs.length < diag.MIN_PAIRS) {
+      stopCode = diag.STOP.INSUFFICIENT;
+      stopReason = `有效 ICP 对应仅 ${pairs.length} 对，少于 ${diag.MIN_PAIRS}，停止优化`;
+      rounds.push({
+        iteration: iter,
+        inputPose,
+        matchedCount: pairs.length,
+        unmatchedCount: rejected.length,
+        residual: inputResidual,
+        step: { accepted: false, meanBefore: inputResidual ? inputResidual.mean : null, meanAfter: null, stepNorm: null, reasonCode: 'INSUFFICIENT_CORRESPONDENCES' },
+        inputFingerprint: roundFingerprint(inputPose, pairs, inputResidual),
+      });
+      history.push({ iteration: iter, pairCount: pairs.length, meanDistance: inputResidual ? inputResidual.mean : null, stepNorm: null });
+      break;
     }
 
     // 高斯-牛顿内迭代：每步重新匹配最近邻，避免固定对应在大步长下失配
@@ -259,6 +313,7 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
       pairs.reduce((a, p) => a + p.weight, 0);
     let lastStep = 0;
     let innerPairs = pairs;
+    let poseStep = { accepted: false, meanBefore: innerMean, meanAfter: innerMean, stepNorm: 0, reasonCode: 'NO_INNER_IMPROVEMENT' };
     for (let gn = 0; gn < 15; gn++) {
       const mv = applyTransform(sourceCloud.points, innerTf);
       const Ai = [];
@@ -292,7 +347,7 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
         }
       }
       innerPairs = fresh;
-      if (fresh.length < 6) break;
+      if (fresh.length < diag.MIN_PAIRS) break;
       const deltaI = solveLeastSquares6(Ai, bi);
       if (!deltaI || deltaI.some((x) => !Number.isFinite(x))) break;
       const [al, be, ga, tx2, ty2, tz2] = deltaI;
@@ -319,6 +374,13 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
         translation: vadd(mApply(Rd, innerTf.translation), [tx2, ty2, tz2]),
       };
       const candMean = meanPairDistance(cand);
+      poseStep = {
+        accepted: candMean < innerMean,
+        meanBefore: innerMean,
+        meanAfter: candMean,
+        stepNorm: Math.hypot(...deltaI),
+        reasonCode: candMean < innerMean ? 'ACCEPTED_RESIDUAL_DROP' : 'REJECTED_NO_RESIDUAL_DROP',
+      };
       if (!(candMean < innerMean)) break;
       innerTf = cand;
       innerMean = candMean;
@@ -327,25 +389,64 @@ function icpRefine(sourceCloud, targetCloud, initialTf, options = {}) {
     }
 
     tf = innerTf;
+    const outputPairs = innerPairs;
+    const outputResidual = pairStats(outputPairs);
+    const round = {
+      iteration: iter,
+      inputPose,
+      matchedCount: pairs.length,
+      unmatchedCount: rejected.length,
+      residual: inputResidual,
+      outputResidual,
+      step: poseStep,
+      inputFingerprint: roundFingerprint(inputPose, pairs, inputResidual),
+    };
+    rounds.push(round);
     history.push({ iteration: iter, pairCount: innerPairs.length, meanDistance: innerMean, stepNorm: lastStep });
+
     if (!Number.isFinite(lastStep)) {
-      return {
-        transform: tf, converged: false,
-        reason: '迭代步长出现非数值（法方程病态），ICP 停止',
-        iterations: iter, history, rejected, pairs: innerPairs,
-      };
+      stopCode = diag.STOP.NUMERIC;
+      stopReason = '迭代步长出现非数值（法方程病态），ICP 停止';
+      break;
+    }
+    // 位姿更新未降低平均点距：若残差已到采样噪声地板则为正常平台收敛，
+    // 否则如实判定收敛停滞，不再把“第一轮没改善”误报为收敛。
+    if (!poseStep.accepted) {
+      if (innerMean <= plateauLimit) {
+        stopCode = diag.STOP.PLATEAU;
+        stopReason = `位姿更新不再降低残差，平台 ${innerMean.toFixed(4)} 处于采样噪声地板 ${noiseFloor.median.toFixed(4)} 以内`;
+      } else {
+        stopCode = diag.STOP.STAGNATED;
+        stopReason = `位姿更新不再降低残差，平台 ${innerMean.toFixed(4)} 高于采样噪声地板 ${noiseFloor.median.toFixed(4)}`;
+      }
+      break;
     }
     if (lastStep < tolerance) {
-      return {
-        transform: tf, converged: true, iterations: iter + 1,
-        history, rejected, pairs: innerPairs,
-      };
+      stopCode = diag.STOP.TOLERANCE;
+      stopReason = '步长低于容差';
+      break;
     }
   }
+  if (!stopCode) {
+    stopCode = diag.STOP.MAX_ITERATIONS;
+    stopReason = `达到最大迭代次数 ${maxIter} 仍未收敛`;
+  }
+
+  const converged = stopCode === diag.STOP.TOLERANCE ||
+    stopCode === diag.STOP.PLATEAU ||
+    (stopCode === diag.STOP.MAX_ITERATIONS && history.length > 0);
   return {
-    transform: tf, converged: false,
-    reason: `达到最大迭代次数 ${maxIter} 仍未收敛`,
-    iterations: maxIter, history, rejected, pairs: lastPairs,
+    transform: tf,
+    converged,
+    stopCode,
+    reason: stopReason,
+    iterations: history.length,
+    history,
+    rounds,
+    noiseFloor,
+    plateauLimit,
+    rejected,
+    pairs: lastPairs,
   };
 }
 

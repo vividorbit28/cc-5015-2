@@ -13,7 +13,60 @@ const state = {
   activePair: null,
   pickMode: null, // 'target' | 'source' | null
   residualMax: 1,
+  // 拖动初始位姿：basePose 是内核候选方案的位姿，滑块只叠加内核允许的增量
+  poseBase: null,       // { rotation, translation, schemeId, label }
+  poseDeltas: { rx: 0, ry: 0, rz: 0, tx: 0, ty: 0, tz: 0 }, // 角度/毫米
+  preview: null,        // 最近一次 /diagnose 返回
+  previewTimer: null,
+  previewLoading: false,
 };
+
+const DEG = Math.PI / 180;
+
+// 绕 X/Y/Z 顺序叠加小角度旋转（内核输出仍为 rigid，det=+1）
+function rotationX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return [1, 0, 0, 0, c, -s, 0, s, c];
+}
+function rotationY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return [c, 0, s, 0, 1, 0, -s, 0, c];
+}
+function rotationZ(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return [c, -s, 0, s, c, 0, 0, 0, 1];
+}
+function matMul(a, b) {
+  const r = new Array(9);
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++)
+      r[3 * i + j] = a[3 * i] * b[j] + a[3 * i + 1] * b[3 + j] + a[3 * i + 2] * b[6 + j];
+  return r;
+}
+function matApply(m, p) {
+  return [
+    m[0] * p[0] + m[1] * p[1] + m[2] * p[2],
+    m[3] * p[0] + m[4] * p[1] + m[5] * p[2],
+    m[6] * p[0] + m[7] * p[1] + m[8] * p[2],
+  ];
+}
+
+function effectivePose() {
+  if (!state.poseBase) return null;
+  const Rz = rotationZ(state.poseDeltas.rz * DEG);
+  const Ry = rotationY(state.poseDeltas.ry * DEG);
+  const Rx = rotationX(state.poseDeltas.rx * DEG);
+  // 增量作用在世界系：R = Rz · Ry · Rx · R_base
+  const rotation = matMul(matMul(Rz, matMul(Ry, Rx)), state.poseBase.rotation);
+  // 平移增量沿增量旋转后的基底；绕原点转动后再叠加纯平移，直观对应“拖动”
+  const rotatedT = matApply(matMul(Rz, matMul(Ry, Rx)), state.poseBase.translation);
+  const translation = [
+    rotatedT[0] + state.poseDeltas.tx,
+    rotatedT[1] + state.poseDeltas.ty,
+    rotatedT[2] + state.poseDeltas.tz,
+  ];
+  return { rotation, translation };
+}
 
 function toast(msg, ms = 3200) {
   const el = $('toast');
@@ -192,12 +245,12 @@ class Viewer {
     return sphere;
   }
 
-  addCorrespondenceLine(a, b) {
+  addCorrespondenceLine(a, b, color = 0xf2e08a) {
     const geo = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(...a), new THREE.Vector3(...b),
     ]);
     const line = new THREE.Line(geo,
-      new THREE.LineBasicMaterial({ color: 0xf2e08a, clippingPlanes: this.clipPlane ? [this.clipPlane] : [] }));
+      new THREE.LineBasicMaterial({ color, clippingPlanes: this.clipPlane ? [this.clipPlane] : [] }));
     line.userData.isCorr = true;
     this.markerGroup.add(line);
   }
@@ -262,6 +315,9 @@ async function loadDataset() {
   $('outlierList').textContent = '无';
   $('confirmRecord').textContent = '未确认';
   ['icpBtn', 'acceptBtn', 'rejectBtn', 'exportBtn'].forEach((id) => $(id).disabled = true);
+  resetPoseControls();
+  renderPreviews(null);
+  $('evidencePanel').textContent = '对方案执行 ICP 后显示逐轮证据链';
   toast(`已载入 ${scenario} 数据集（会话 ${state.session.sessionId.slice(0, 8)}）`);
 }
 
@@ -278,6 +334,7 @@ function renderStaticViewers() {
   refreshMarkers();
   targetViewer.frameContent();
   sourceViewer.frameContent();
+  renderPreviews(null);
 }
 
 function refreshMarkers() {
@@ -365,6 +422,8 @@ async function runRegister() {
   const first = state.session.schemes[0];
   if (first) selectScheme(first.id);
   toast(`生成 ${state.session.schemes.length} 个候选方案，请结合警告人工甄别`);
+  // 内核候选位姿就绪：交由内核驱动拖动控件，而不是前端自造位姿
+  syncPoseOptions();
 }
 
 function renderSchemes() {
@@ -395,7 +454,9 @@ async function selectScheme(id) {
   renderOverlap(s);
   renderDiagnostics(s);
   renderOutliers(s);
+  renderEvidence(s);
   ['icpBtn', 'acceptBtn', 'rejectBtn', 'exportBtn'].forEach((bid) => $(bid).disabled = false);
+  syncPoseOptions(s);
 }
 
 // ---------- 叠合与残差可视化 ----------
@@ -417,7 +478,7 @@ function residualColor(d, dmax) {
   return [Math.max(0, Math.min(1, r)), Math.max(0, Math.min(1, g)), Math.max(0, b)];
 }
 
-function renderOverlap(scheme) {
+function renderOverlap(scheme, overridePose = null) {
   overlapViewer.clearGroups();
   const g = state.geometry;
   // 目标始终原样显示
@@ -428,30 +489,44 @@ function renderOverlap(scheme) {
     overlapViewer.frameContent();
     return;
   }
-  const moved = applyTransformArr(g.source.cloud.points, scheme.transform);
-  if ($('showResidual').checked && scheme.pointResiduals) {
-    const valid = scheme.pointResiduals.filter((d) => d != null);
+  const pose = overridePose || scheme.transform;
+  const moved = applyTransformArr(g.source.cloud.points, pose);
+  // 预览时残差来自 /api/diagnose（与源点云同索引）；正式方案来自方案记录
+  const residuals = overridePose && state.preview ? state.preview.coverage.pointResiduals
+    : scheme.pointResiduals;
+  if ($('showResidual').checked && residuals) {
+    const valid = residuals.filter((d) => d != null);
     state.residualMax = Math.max(...valid, 1e-9);
-    const colors = scheme.pointResiduals.map((d) =>
-      d == null ? [0.6, 0.6, 0.6] : residualColor(d, state.residualMax));
+    const colors = residuals.map((d) =>
+      d == null ? [0.55, 0.55, 0.55] : residualColor(d, state.residualMax));
     overlapViewer.setCloudVertexColors(moved, colors, g.source.cloud.normals);
   } else {
     overlapViewer.setCloud(moved, g.source.cloud.normals, 0xff9d5c);
   }
   if ($('showMesh').checked) {
-    const movedVerts = applyTransformArr(g.source.mesh.vertices, scheme.transform);
+    const movedVerts = applyTransformArr(g.source.mesh.vertices, pose);
     overlapViewer.setMesh(movedVerts, g.source.mesh.faces, 0xff9d5c, 0.22);
     overlapViewer.setMesh(g.target.mesh.vertices, g.target.mesh.faces, 0x6fb1ff, 0.18);
   }
-  // 对应点连线（仅当前方案内点）
-  const inSet = new Set(scheme.inlierIndices || []);
-  state.session.correspondences.forEach((c, i) => {
-    if (!inSet.has(i)) return;
-    const mp = applyTransformArr([c.sourcePoint], scheme.transform)[0];
-    overlapViewer.addCorrespondenceLine(mp, c.targetPoint);
-  });
+  // 对应点连线：预览按逐对原因着色（内点=黄，超阈值=红）
+  if (overridePose && state.preview) {
+    const items = state.preview.correspondencePoints.items;
+    state.session.correspondences.forEach((c, i) => {
+      const item = items[i];
+      const mp = applyTransformArr([c.sourcePoint], pose)[0];
+      overlapViewer.addCorrespondenceLine(mp, c.targetPoint, item && item.inlier ? 0xf2e08a : 0xe5604f);
+    });
+  } else {
+    const inSet = new Set(scheme.inlierIndices || []);
+    state.session.correspondences.forEach((c, i) => {
+      if (!inSet.has(i)) return;
+      const mp = applyTransformArr([c.sourcePoint], pose)[0];
+      overlapViewer.addCorrespondenceLine(mp, c.targetPoint);
+    });
+  }
   applyClip();
-  overlapViewer.frameContent();
+  // 拖动预览时不再自动重置相机，避免每次滑动镜头跳动
+  if (!overridePose) overlapViewer.frameContent();
 }
 
 function renderDiagnostics(s) {
@@ -493,8 +568,15 @@ async function runIcp() {
     renderSchemes();
     const newIcp = state.session.schemes.filter((s) => s.source === 'icp').pop();
     selectScheme(newIcp.id);
-    toast('ICP 完成，结果已另存为新方案（原方案与原始模型保留）');
-  } catch (e) { toast(e.message); }
+    syncPoseOptions(newIcp);
+    if (newIcp.replay && newIcp.replay.stable === false) {
+      toast('ICP 完成，但逐轮重放不一致：证据不可信，已在证据面板标红');
+    } else if (newIcp.evidence && newIcp.evidence.cause && newIcp.evidence.cause.primary !== 'NONE') {
+      toast(`ICP 完成（${newIcp.icp.stopCode}）：诊断主因 ${newIcp.evidence.cause.primary}`);
+    } else {
+      toast('ICP 完成，结果已另存为新方案（原方案与原始模型保留）');
+    }
+  } catch (e) { toast(`ICP 失败：${e.message}`); }
 }
 
 async function confirm(decision) {
@@ -529,6 +611,253 @@ async function exportScheme() {
   a.click();
   URL.revokeObjectURL(a.href);
   toast('已导出含约定、变换、原始/变换点云与确认记录的可复算 JSON');
+}
+
+// ---------- 拖动初始位姿（内核驱动） ----------
+// 控件选项完全来自内核产出的候选方案；没有候选时控件禁用，
+// 不提供“前端凭空造位姿”的入口，避免结果与配准内核脱节。
+function syncPoseOptions(selected = null) {
+  const select = $('poseSchemeSelect');
+  const schemes = state.session ? state.session.schemes : [];
+  select.innerHTML = schemes.length
+    ? schemes.map((s) => `<option value="${s.id}">#${s.id} ${s.label}</option>`).join('')
+    : '<option value="">（先配准，生成候选位姿）</option>';
+  const useId = selected ? selected.id : (state.selectedScheme != null ? state.selectedScheme : (schemes[0] && schemes[0].id));
+  if (useId != null) select.value = String(useId);
+  select.disabled = !schemes.length;
+  setPoseBaseFromScheme();
+}
+
+function setPoseBaseFromScheme() {
+  const id = Number($('poseSchemeSelect').value);
+  const scheme = state.session && state.session.schemes.find((s) => s.id === id);
+  if (!scheme) { resetPoseControls(); return; }
+  state.poseBase = {
+    rotation: scheme.transform.rotation.slice(),
+    translation: scheme.transform.translation.slice(),
+    schemeId: id,
+    label: scheme.label,
+  };
+  state.poseDeltas = { rx: 0, ry: 0, rz: 0, tx: 0, ty: 0, tz: 0 };
+  setPoseControlsEnabled(true);
+  syncPoseSliderLabels();
+  requestPreview();
+}
+
+function setPoseControlsEnabled(on) {
+  ['poseRx', 'poseRy', 'poseRz', 'poseTx', 'poseTy', 'poseTz'].forEach((id) => $(id).disabled = !on);
+  $('poseResetBtn').disabled = !on;
+}
+
+function resetPoseControls() {
+  state.poseBase = null;
+  state.poseDeltas = { rx: 0, ry: 0, rz: 0, tx: 0, ty: 0, tz: 0 };
+  ['poseRx', 'poseRy', 'poseRz', 'poseTx', 'poseTy', 'poseTz'].forEach((id) => {
+    $(id).value = 0;
+    $(id).disabled = true;
+  });
+  $('poseResetBtn').disabled = true;
+  syncPoseSliderLabels();
+  state.preview = null;
+  renderPreviewStats();
+}
+
+function syncPoseSliderLabels() {
+  const d = state.poseDeltas;
+  $('poseRxVal').textContent = `${d.rx}°`;
+  $('poseRyVal').textContent = `${d.ry}°`;
+  $('poseRzVal').textContent = `${d.rz}°`;
+  $('poseTxVal').textContent = `${d.tx} mm`;
+  $('poseTyVal').textContent = `${d.ty} mm`;
+  $('poseTzVal').textContent = `${d.tz} mm`;
+}
+
+function onPoseSliderInput() {
+  state.poseDeltas = {
+    rx: Number($('poseRx').value),
+    ry: Number($('poseRy').value),
+    rz: Number($('poseRz').value),
+    tx: Number($('poseTx').value),
+    ty: Number($('poseTy').value),
+    tz: Number($('poseTz').value),
+  };
+  syncPoseSliderLabels();
+  // 拖动即时反映在视口；诊断请求做去抖，避免每帧都打后端
+  const pose = effectivePose();
+  const s = state.session.schemes.find((x) => x.id === state.selectedScheme);
+  if (s && pose) renderOverlap(s, pose);
+  requestPreview();
+}
+
+function resetPoseToScheme() {
+  state.poseDeltas = { rx: 0, ry: 0, rz: 0, tx: 0, ty: 0, tz: 0 };
+  ['poseRx', 'poseRy', 'poseRz', 'poseTx', 'poseTy', 'poseTz'].forEach((id) => { $(id).value = 0; });
+  syncPoseSliderLabels();
+  requestPreview();
+}
+
+function requestPreview() {
+  clearTimeout(state.previewTimer);
+  state.previewTimer = setTimeout(runPreview, 140);
+}
+
+async function runPreview() {
+  if (!state.session || !state.poseBase) return;
+  const pose = effectivePose();
+  if (!pose) return;
+  const body = { pose };
+  const it = Number($('inlierThreshold').value);
+  const od = Number($('overlapDistance').value);
+  if (Number.isFinite(it) && it > 0) body.inlierThreshold = it;
+  if (Number.isFinite(od) && od > 0) body.overlapDistance = od;
+  state.previewLoading = true;
+  try {
+    state.preview = await api(`/api/sessions/${state.session.sessionId}/diagnose`, 'POST', body);
+    state.previewError = null;
+  } catch (e) {
+    // 诊断失败必须回到配准面板，不得用默认值伪装成功
+    state.preview = null;
+    state.previewError = e.message;
+    toast(`诊断预览失败：${e.message}`);
+  } finally {
+    state.previewLoading = false;
+  }
+  renderPreviewStats();
+  const s = state.session.schemes.find((x) => x.id === state.selectedScheme);
+  if (s && state.preview) renderOverlap(s, pose);
+}
+
+function renderPreviewStats() {
+  const p = state.preview;
+  const strip = $('previewStrip');
+  strip.classList.toggle('hidden', false);
+  if (state.previewError) {
+    $('previewOverlap').textContent = '重合 —';
+    $('previewResidual').textContent = '距离残差 —';
+    $('previewCorr').textContent = '有效对应 —';
+    $('previewCause').textContent = `诊断失败：${state.previewError}`;
+    $('previewCause').className = 'pill bad';
+    $('poseStatus').textContent = '诊断失败：未返回结果（不以默认值代替）';
+    return;
+  }
+  if (!p) {
+    $('previewOverlap').textContent = '重合 —';
+    $('previewResidual').textContent = '距离残差 —';
+    $('previewCorr').textContent = '有效对应 —';
+    $('previewCause').textContent = '根因 —';
+    ['previewOverlap', 'previewResidual', 'previewCorr', 'previewCause']
+      .forEach((id) => { $(id).className = 'pill'; });
+    $('poseStatus').textContent = '拖动滑块以试探配准，实时显示重合与残差';
+    return;
+  }
+  const ov = p.coverage.overlapFraction;
+  const matched = p.validCorrespondence.matchedCount;
+  const total = matched + p.validCorrespondence.unmatchedCount;
+  const res = p.validCorrespondence.residual;
+  $('previewOverlap').textContent = `重合 ${(ov * 100).toFixed(1)}% · 目标覆盖 ${(p.coverage.targetCoverageFraction * 100).toFixed(1)}%`;
+  $('previewOverlap').className = `pill ${ov >= 0.5 ? 'good' : ov > 0.2 ? 'warn' : 'bad'}`;
+  $('previewResidual').textContent = res
+    ? `距离残差 中位 ${res.median.toFixed(3)} / 均值 ${res.mean.toFixed(3)} mm`
+    : '距离残差 —（无匹配点）';
+  $('previewResidual').className = 'pill';
+  $('previewCorr').textContent = `有效对应 ${matched}/${total}`;
+  $('previewCorr').className = `pill ${p.validCorrespondence.satisfiesMinimum ? 'good' : 'bad'}`;
+  const cause = p.cause;
+  $('previewCause').textContent = `根因 ${cause.primary}` +
+    (cause.secondary.length ? ` · ${cause.secondary.join(' / ')}` : '');
+  $('previewCause').className = `pill ${cause.primary === 'NONE' ? 'good' : 'warn'}`;
+  const outliers = p.correspondencePoints.outlierCount;
+  $('poseStatus').textContent =
+    `逐对原因：${p.correspondencePoints.inlierCount} 对在内点阈值内，${outliers} 对超出` +
+    `（阈值 ${p.correspondencePoints.threshold.toFixed(3)} mm）`;
+}
+
+// ---------- ICP 证据面板 ----------
+function renderEvidence(s) {
+  const el = $('evidencePanel');
+  if (!s || !s.evidence) {
+    el.innerHTML = '<span class="muted">该方案尚无迭代证据；执行 ICP 局部优化后生成。</span>';
+    return;
+  }
+  if (s.evidence.error) {
+    el.innerHTML = `<div class="finding error">证据生成失败：${escapeHtml(s.evidence.error)}</div>`;
+    return;
+  }
+  const ev = s.evidence;
+  const cause = ev.cause || {};
+  const stop = ev.stop || {};
+  const budget = ev.roundBudget || {};
+  const rows = [
+    ['证据指纹', `<code>${escapeHtml(ev.fingerprint || '—')}</code>`],
+    ['停止条件', `${stop.code || '—'}${stop.converged ? '（收敛）' : ''}`],
+    ['迭代轮数', `${budget.totalRounds ?? '—'} 轮；保留 ${budget.retainedRounds ?? '—'}，省略 ${budget.omittedRounds ?? '—'}`],
+    ['初始 → 最终重叠',
+      `${(ev.coverage.initialOverlapFraction * 100).toFixed(1)}% → ${(ev.coverage.finalOverlapFraction * 100).toFixed(1)}%`],
+    ['采样噪声地板', ev.noiseFloor && Number.isFinite(ev.noiseFloor.median)
+      ? `${ev.noiseFloor.median.toFixed(3)} mm` : '—'],
+    ['尺度距离比', ev.scaleRatios && ev.scaleRatios.available
+      ? `${ev.scaleRatios.median.toFixed(3)}（IQR ${ev.scaleRatios.iqr.toFixed(3)}）` : '不可用'],
+  ];
+  let html = rows.map(([k, v]) => `<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('');
+  html += `<h3>根因</h3><div class="cause-primary">${escapeHtml(cause.primary || '—')}` +
+    (cause.secondary && cause.secondary.length ? ` + ${escapeHtml(cause.secondary.join(', '))}` : '') + '</div>';
+  if (cause.evidence && cause.evidence.length) {
+    html += cause.evidence.map((e) =>
+      `<div class="finding ${e.code === cause.primary ? 'warning' : 'info'}">[${e.stage}/${e.code}] ${escapeHtml(e.message)}</div>`).join('');
+  }
+  html += '<h3>残差下降</h3>';
+  html += sparkline((ev.residualTrend || []).map((t) => t.mean), '#5b9dff');
+  html += (ev.residualTrend || []).map((t) =>
+    `<div class="trend-row"><span>第 ${t.iteration} 轮</span><span>均值 ${fmtNum(t.mean)}</span>` +
+    `<span>${t.drop == null ? '—' : (t.drop >= 0 ? `下降 ${fmtNum(t.drop)}` : `上升 ${fmtNum(-t.drop)}`)}</span></div>`).join('');
+  html += '<h3>有效对应</h3>';
+  html += (ev.validCorrespondenceTrend || []).map((t) =>
+    `<div class="trend-row"><span>第 ${t.iteration} 轮</span><span>匹配 ${t.matched}</span>` +
+    `<span>未匹配 ${t.unmatched}</span><span class="${t.satisfiesMinimum ? 'ok-text' : 'danger-text'}">` +
+    `${t.satisfiesMinimum ? '满足下限' : '低于下限'}</span></div>`).join('');
+  html += '<h3>阶段定位</h3>';
+  html += (ev.stageFindings || []).map((f) =>
+    `<div class="finding ${f.severity}">[${f.stage}/${f.severity}] ${escapeHtml(f.code)}：${escapeHtml(f.message)}</div>`).join('')
+    || '<div class="muted">无异常阶段</div>';
+  if (s.replay) {
+    html += '<h3>单轮重放</h3>';
+    html += `<div class="${s.replay.stable ? 'replay-ok' : 'replay-bad'}">` +
+      `${s.replay.stable ? '逐轮重放指纹一致' : '存在重放不一致轮次，证据不可信'}</div>`;
+    html += (s.replay.rounds || []).map((r) =>
+      `<div class="trend-row"><span>第 ${r.iteration} 轮</span><span><code>${escapeHtml(r.fingerprint || '')}</code></span>` +
+      `<span class="${r.match ? 'ok-text' : 'danger-text'}">${r.match ? '一致' : '不一致'}</span></div>`).join('');
+  }
+  el.innerHTML = html;
+}
+
+function sparkline(values, color) {
+  const vals = values.filter((v) => Number.isFinite(v));
+  if (!vals.length) return '';
+  const w = 100; const h = 100; // 用 viewBox 归一化，宽度自适应
+  const min = Math.min(...vals); const max = Math.max(...vals);
+  const span = max - min || 1;
+  const pts = vals.map((v, i) => {
+    const x = vals.length === 1 ? 50 : (i / (vals.length - 1)) * w;
+    const y = h - ((v - min) / span) * (h - 10) - 5;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(' ');
+  return `<svg class="spark" viewBox="0 0 100 100" preserveAspectRatio="none">` +
+    `<polyline fill="none" stroke="${color}" stroke-width="2" points="${pts}" /></svg>`;
+}
+
+function fmtNum(x) {
+  return Number.isFinite(x) ? x.toFixed(3) : '—';
+}
+
+function escapeHtml(text) {
+  return String(text == null ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderPreviews(scheme) {
+  renderPreviewStats();
+  if (scheme) renderEvidence(scheme);
 }
 
 // ---------- 剖面 ----------
@@ -579,6 +908,11 @@ function init() {
   $('acceptBtn').addEventListener('click', () => confirm('accepted').catch((e) => toast(e.message)));
   $('rejectBtn').addEventListener('click', () => confirm('rejected').catch((e) => toast(e.message)));
   $('exportBtn').addEventListener('click', () => exportScheme().catch((e) => toast(e.message)));
+  // 拖动初始位姿：选项与基准位姿来自内核候选，滑块只做局部试探
+  $('poseSchemeSelect').addEventListener('change', () => setPoseBaseFromScheme());
+  ['poseRx', 'poseRy', 'poseRz', 'poseTx', 'poseTy', 'poseTz'].forEach((id) =>
+    $(id).addEventListener('input', onPoseSliderInput));
+  $('poseResetBtn').addEventListener('click', resetPoseToScheme);
   $('showMesh').addEventListener('change', () => { renderStaticViewers(); if (state.selectedScheme != null) selectScheme(state.selectedScheme); });
   $('showResidual').addEventListener('change', () => { if (state.selectedScheme != null) selectScheme(state.selectedScheme); });
   $('clipAxis').addEventListener('change', applyClip);

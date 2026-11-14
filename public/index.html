@@ -56,6 +56,27 @@
       <h2>3. 刚性配准（无缩放）</h2>
       <label>内点阈值 (mm) <input type="number" id="inlierThreshold" placeholder="自动=对角2%" step="0.1" /></label>
       <label>重叠搜索半径 (mm) <input type="number" id="overlapDistance" placeholder="自动=对角2%" step="0.1" /></label>
+      <label class="inline">
+        <span>初始位姿来源</span>
+        <span class="muted small">由内核候选方案驱动，不在此手填变换矩阵</span>
+      </label>
+      <div class="row">
+        <select id="poseSchemeSelect" disabled>
+          <option value="">（先配准，生成候选位姿）</option>
+        </select>
+      </div>
+      <div class="pose-grid">
+        <label>绕 X <input type="range" id="poseRx" min="-180" max="180" step="1" value="0" disabled /><span id="poseRxVal" class="muted small">0°</span></label>
+        <label>绕 Y <input type="range" id="poseRy" min="-180" max="180" step="1" value="0" disabled /><span id="poseRyVal" class="muted small">0°</span></label>
+        <label>绕 Z <input type="range" id="poseRz" min="-180" max="180" step="1" value="0" disabled /><span id="poseRzVal" class="muted small">0°</span></label>
+        <label>平移 X <input type="range" id="poseTx" min="-120" max="120" step="1" value="0" disabled /><span id="poseTxVal" class="muted small">0 mm</span></label>
+        <label>平移 Y <input type="range" id="poseTy" min="-120" max="120" step="1" value="0" disabled /><span id="poseTyVal" class="muted small">0 mm</span></label>
+        <label>平移 Z <input type="range" id="poseTz" min="-120" max="120" step="1" value="0" disabled /><span id="poseTzVal" class="muted small">0 mm</span></label>
+      </div>
+      <div class="row">
+        <button id="poseResetBtn" class="ghost" disabled>回到方案位姿</button>
+        <span id="poseStatus" class="muted small">拖动滑块以试探配准，实时显示重合与残差</span>
+      </div>
       <button id="registerBtn" class="primary" disabled>估计刚性变换（Kabsch + RANSAC）</button>
       <p class="muted small">系统保留多个候选；退化、对称、重叠不足均给出警告，不因残差小断言同源。</p>
     </section>
@@ -70,7 +91,7 @@
         <button id="acceptBtn" class="ok" disabled>人工确认采纳</button>
         <button id="rejectBtn" class="danger" disabled>人工否决</button>
       </div>
-      <button id="exportBtn" class="ghost" disabled>导出可复算 JSON</button>
+      <button id="exportBtn" class="ghost" disabled>导出可复算 JSON（含迭代证据）</button>
     </section>
   </aside>
 
@@ -103,11 +124,18 @@
         </span>
       </div>
       <div id="overlapView" class="view-canvas tall"></div>
+      <div class="preview-strip" id="previewStrip">
+        <span class="pill" id="previewOverlap">重合 —</span>
+        <span class="pill" id="previewResidual">距离残差 —</span>
+        <span class="pill" id="previewCorr">有效对应 —</span>
+        <span class="pill" id="previewCause">根因 —</span>
+      </div>
       <div class="legend">
         <span>残差色标：</span>
         <span class="swatch good"></span> 0
         <span class="swatch mid"></span>
         <span class="swatch bad"></span> 大（mm，按当前方案最大残差归一）
+        <span class="legend-note">灰点 = 搜索半径内无目标点（碎片未重合）</span>
       </div>
     </div>
   </section>
@@ -120,6 +148,10 @@
     <section class="card">
       <h2>诊断与残差</h2>
       <div id="diagnostics" class="diagnostics muted small">选择方案后显示</div>
+    </section>
+    <section class="card">
+      <h2>配准诊断证据</h2>
+      <div id="evidencePanel" class="evidence muted small">对方案执行 ICP 后显示逐轮证据链</div>
     </section>
     <section class="card">
       <h2>离群点审计</h2>

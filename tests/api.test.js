@@ -83,6 +83,57 @@ async function main() {
     Array.isArray(icpScheme.icp.history) && 'rejectedCount' in icpScheme.icp);
   ok('原 RANSAC 方案仍保留', icpResp.schemes.some((s) => s.id === best.id && s.source === 'ransac'));
 
+  console.log('== D2. 迭代证据与逐轮重放 ==');
+  ok('ICP 方案携带证据摘要与指纹', icpScheme.evidence && icpScheme.evidence.fingerprint &&
+    typeof icpScheme.evidence.fingerprint === 'string');
+  ok('证据含残差下降与有效对应趋势',
+    Array.isArray(icpScheme.icp.residualTrend) && Array.isArray(icpScheme.icp.validCorrespondenceTrend));
+  ok('证据含阶段定位与根因', Array.isArray(icpScheme.icp.stageFindings) && icpScheme.icp.cause &&
+    typeof icpScheme.icp.cause.primary === 'string');
+  ok('逐轮重放全部一致', icpScheme.replay && icpScheme.replay.stable === true);
+  const evidenceResp = await call(`/api/sessions/${sid}/schemes/${icpScheme.id}/evidence`);
+  ok('证据接口返回完整证据', evidenceResp.evidence.fingerprint === icpScheme.evidence.fingerprint);
+  ok('证据接口复算重放稳定', evidenceResp.replayStable === true &&
+    evidenceResp.replay.every(Boolean));
+  ok('证据不含测试真值字段', !('groundTruth' in evidenceResp.evidence));
+
+  console.log('== D3. 拖拽位姿诊断预览 ==');
+  const geo2 = await call(`/api/sessions/${sid}/geometry`);
+  const identityPose = {
+    rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+    translation: [0, 0, 0],
+  };
+  const preview = await call(`/api/sessions/${sid}/diagnose`, 'POST', { pose: identityPose });
+  ok('预览返回显式参数来源（不隐藏默认值）',
+    preview.params && Number.isFinite(preview.params.inlierThreshold) &&
+    Number.isFinite(preview.params.maxDistance));
+  ok('预览回报参数推导来源', preview.paramsDerivedFrom &&
+    typeof preview.paramsDerivedFrom.inlierThreshold === 'string' &&
+    preview.paramsDerivedFrom.sourceTargetDiagonal.target > 0);
+  ok('预览返回重叠、有效对应与逐对原因',
+    Number.isFinite(preview.coverage.overlapFraction) &&
+    Number.isFinite(preview.validCorrespondence.matchedCount) &&
+    preview.correspondencePoints.items.length === ds.correspondences.length &&
+    preview.correspondencePoints.items.every((it) => typeof it.reason === 'string'));
+  ok('预览给出根因（错误初值下非 NONE）', preview.cause.primary !== 'NONE');
+  ok('预览不修改会话（方案数不变）',
+    (await call(`/api/sessions/${sid}`)).schemes.length === icpResp.schemes.length);
+  let badPose = false;
+  try {
+    await call(`/api/sessions/${sid}/diagnose`, 'POST', { pose: { rotation: [1, 0, 0], translation: [0, 0, 0] } });
+  } catch { badPose = true; }
+  ok('非 3x3 位姿被拒绝', badPose);
+  let badThreshold = false;
+  try {
+    await call(`/api/sessions/${sid}/diagnose`, 'POST', { pose: identityPose, inlierThreshold: -1 });
+  } catch { badThreshold = true; }
+  ok('非法阈值显式报错，不落回默认值', badThreshold);
+
+  console.log('== D4. 诊断失败不遮错 ==');
+  let previewNoSession = false;
+  try { await call('/api/sessions/deadbeef/diagnose', 'POST', { pose: identityPose }); } catch { previewNoSession = true; }
+  ok('失效会话诊断返回错误而非默认结果', previewNoSession);
+
   console.log('== E. 人工确认绑定输入与参数 ==');
   let noOperator = false;
   try { await call(`/api/sessions/${sid}/schemes/${icpScheme.id}/confirm`, 'POST', { decision: 'accepted' }); }
@@ -104,6 +155,10 @@ async function main() {
   ok('导出同时含原始与变换后源点云',
     exp.originalSourceCloud.points.length === exp.transformedSourceCloud.points.length);
   ok('导出含真值（仅用于验证）与确认记录', exp.groundTruth && exp.confirmation);
+  ok('导出升级为 v2 并携带证据与重放摘要',
+    exp.exportVersion === 2 && exp.evidence && exp.evidence.fingerprint === icpScheme.evidence.fingerprint &&
+    exp.replay && exp.replay.stable === true);
+  ok('导出注明证据不含真值', /不含测试真值/.test(exp.conventions.evidenceScope || ''));
 
   console.log('== G. 镜像场景的警告链路 ==');
   const mir = await call('/api/datasets', 'POST', { scenario: 'mirrored', seed: 21 });
